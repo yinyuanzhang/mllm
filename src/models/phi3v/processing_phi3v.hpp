@@ -404,6 +404,15 @@ public:
 
             std::string pattern = "<\\|image_\\d+\\|>";
             std::vector<std::string> result = re_split(new_text, pattern);
+
+            // 打印 result 的内容
+            std::cout << "Contents of result:" << std::endl;
+            for (const auto& item : result) {
+                std::cout << item << std::endl; // 打印每个元素
+            }
+            std::cout << "Size of new_text splitted result: " << result.size() << std::endl;
+
+
             vector<vector<int>> prompt_chunks;
             for (auto rtest : result) {
                 auto prompt_chunk = tokenizer->tokenize_vector(rtest);
@@ -411,6 +420,10 @@ public:
             }
             auto image_tags = re_findall(new_text, pattern);
             auto image_ids = image_tags2ids(image_tags);
+
+            // 打印 image_ids_pad 的大小
+            std::cout << "Size of image_ids_pad: " << image_ids.size() << std::endl;
+
             vector<vector<int>> image_ids_pad;
             for (int i = 0; i < image_ids.size(); i++) {
                 vector<int> image_id_pad(num_img_tokens[i], -image_ids[i]);

@@ -31,12 +31,21 @@ public:
         position_embedding = Embedding(range_len_, hidden_dim, base_name + names._position_embeddings_name);
     }
     vector<Tensor> Forward(vector<Tensor> inputs, vector<std::any> args) override {
+        // 记录开始进行Phi3Embedding处理的时间
+        std::time_t start_phi3VisionEmbedding_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::cout << "Start Phi3VisionEmbedding time: " << std::ctime(&start_phi3VisionEmbedding_time); 
+
+
         auto embd = patch_embedding(inputs[0]);
         embd = embd.transpose({{SEQUENCE, DIMENSION}, {HEAD, SEQUENCE}}); // BSHD->BDHS->BDSH
         embd = embd.flatten(HEAD, SEQUENCE);
         embd = Tensor::cat({cls_token(), embd}, SEQUENCE);
         auto position_ids = Tensor::range(0, range_len_);
         embd = position_embedding(position_ids) + embd;
+
+        // 记录完成Phi3Embedding处理的时间
+        std::time_t end_phi3VisionEmbedding_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::cout << "End Phi3VisionEmbedding time: " << std::ctime(&end_phi3VisionEmbedding_time); 
         return {embd};
     }
 };
@@ -57,12 +66,21 @@ public:
         blocks = List<ViTBlock>(block_num, hidden_dim, head_size, ffn_hidden, act_fn_type, names, base_name + names._layer_name);
     }
     vector<Tensor> Forward(vector<Tensor> inputs, vector<std::any> args) override {
+        // 记录开始进行Phi3VisionModel处理的时间
+        std::time_t start_phi3VisionModel_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::cout << "Start Phi3VisionModel time: " << std::ctime(&start_phi3VisionModel_time); 
+
         auto x = embedding(inputs)[0];
         x = pre_layrnorm(x);
         for (auto &block : blocks) {
             x = block({x})[0];
         }
         x = x.clip({}, {}, {1, clip_len_}, {});
+
+        // 记录完成Phi3VisionModel处理的时间
+        std::time_t end_phi3VisionModel_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::cout << "End Phi3VisionModel time: " << std::ctime(&end_phi3VisionModel_time); 
+
         return {x};
     }
 };
@@ -105,10 +123,25 @@ public:
     }
 
     vector<Tensor> Forward(vector<Tensor> inputs, vector<std::any> args) override {
+        // 记录开始进行Phi3Embedding处理的时间
+        std::time_t start_phi3Embedding_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::cout << "Start Phi3Embedding time: " << std::ctime(&start_phi3Embedding_time); 
+
         bool have_img = inputs[1].batch() > 0;
         auto text_features = embed_tokens({inputs[0]});
+
+        // 记录完成text-token编码的时间
+        std::time_t complete_embed_token_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::cout << "complete text embed_token time: " << std::ctime(&complete_embed_token_time); 
+
         if (have_img) {
             auto image_features = img_processor({inputs[1]})[0];
+
+            // 记录完成token编码的时间
+            std::time_t complete_img_processor_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            std::cout << "complete img_processor time: " << std::ctime(&complete_img_processor_time); 
+
+
             auto global_image_features = image_features.clip({0}, {}, {}, {});
             auto global_image_features_hd = Tensor::phi3v_hd_merge(global_image_features, 1, 1);
             auto global_image_features_hd_newline = add_image_newline(global_image_features_hd);
@@ -135,9 +168,14 @@ public:
             }
             for (int i = 0; i < inputs[2].sequence(); i++) {
                 auto where_idx = inputs[0].where(-1 * (i + 1), SEQUENCE);
+                image_features.saveNData<float>("image");
                 text_features = text_features.index_put(image_features, where_idx, false);
             }
         }
+        // 记录完成Phi3Embedding处理的时间
+        std::time_t end_phi3Embedding_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::cout << "End Phi3Embedding time: " << std::ctime(&end_phi3Embedding_time); 
+
         return {text_features};
     }
 };
@@ -163,12 +201,22 @@ public:
         lm_head = Linear(hidden_dim, vocab_size, false, names.lm_head_name);
     }
     vector<Tensor> Forward(vector<Tensor> inputs, vector<std::any> args) override {
+        // 记录开始进行Model处理的时间
+        std::time_t start_phi3VModel_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::cout << "Start Phi3VModel time: " << std::ctime(&start_phi3VModel_time); 
+
         auto x = vision_embed_tokens(inputs)[0];
         for (auto &block : blocks) {
             x = block({x})[0];
         }
         x = norm(x);
         x = lm_head(x);
+
+        // 记录开始进行Model处理的时间
+        std::time_t end_phi3VModel_time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::cout << "End Phi3VModel time: " << std::ctime(&end_phi3VModel_time); 
+
+        std::cout << "-----------------------End------------------------" << std::ctime(&end_phi3VModel_time); 
         return {x};
     }
 
