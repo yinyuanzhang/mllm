@@ -15,6 +15,7 @@
 #include "Op.hpp"
 #include "ParamLoader.hpp"
 #include "Backend.hpp"
+#include "Trace.hpp"
 
 #include <Module.hpp>
 
@@ -39,6 +40,7 @@ public:
         return init_;
     }
     bool inited_loaded = false;
+    bool loaded_param = false;
     static map<string, string> layername_2_tensorname;
     static bool use_layername_2_tensorname;
 
@@ -60,6 +62,42 @@ public:
     Tensor &operator()(Tensor &input0, Tensor &input1, Tensor &input2, Tensor &input3) {
         auto ts = run({input0, input1, input2, input3}, 1);
         return ts[0].get();
+    }
+
+    void load() {
+        if (inited_loaded && loaded_param)
+            return;
+        if (op_ == nullptr) {
+#ifdef USE_QNN
+            if ((param_["type"] == KVCACHE || param_["type"] == KVCACHENPU) && (Backend::global_backends.find(MLLM_QNN) != Backend::global_backends.end())) {
+                if (kv_cache_map.find(name_) == kv_cache_map.end()) {
+                    // for the prefill part, we need to create a new op
+                    param_["type"] = KVCACHENPU;
+                    op_ = backend_->opCreate(param_, name_);
+                    kv_cache_map[name_] = op_;
+                } else {
+#ifdef DEBUGPRINT
+                    std::cout << name_ << " is shared used" << std::endl;
+#endif
+                    // for the decoding part, we need to get created op from global container
+                    op_ = kv_cache_map[name_];
+                }
+            } else {
+                op_ = backend_->opCreate(param_, name_);
+            }
+#else
+            op_ = backend_->opCreate(param_, name_);
+#endif
+        }
+        op_->load(*Module::llm_model_ptr->loader);
+        loaded_param = true;
+    }
+    bool &loaded() {
+        return loaded_param;
+    }
+    void free() {
+        op_->free({}, {});
+        loaded_param = false;
     }
 
 private:
@@ -118,11 +156,13 @@ protected:
         }
         map<string, shared_ptr<Tensor>> &activation_tensors = module->activation_tensors;
         auto &activation_tensors_num = module->activation_tensors_num;
-        Module::runlistIdx = saved_list_idx;
+        // Module::runlistIdx = saved_list_idx;
         bool do_init = false;
-        // set backend to current module device and try to create op
-        backend_ = Backend::global_backends[Module::tmp_device];
+
         if (module->doLoad || !inited_loaded) {
+            // set backend to current module device and try to create op
+            // use Module::tmp_device only when creating the op as the recersive module backend only handled in load and init stage
+            backend_ = Backend::global_backends[Module::tmp_device];
             do_init = !inited_loaded;
             if (op_ == nullptr) {
 #ifdef USE_QNN
@@ -149,10 +189,14 @@ protected:
             if (module->doLoad) {
                 op_->load(*module->loader);
                 inited_loaded = true;
+            } else if (loaded_param) {
+                inited_loaded = loaded_param;
             } else {
                 if (!inited_loaded) {
-                    module->loader = new ParamLoader("");
-                    op_->load(*module->loader);
+                    // module->loader = new ParamLoader("");
+                    // op_->load(*module->loader);
+                    auto empty_loader = new ParamLoader("");
+                    op_->load(*empty_loader);
                     inited_loaded = true;
                 }
             }
@@ -200,7 +244,7 @@ protected:
         for (auto &input : inputs) {
             if (input.shouldInGraphs()) {
                 auto input_name = input.name();
-                if (param_["type"] == KVCACHE && do_init) {
+                if (param_["type"] == KVCACHE && do_init && use_layername_2_tensorname) {
                     input_name = name_X_to_num(input_name, saved_list_idx);
                 }
                 input_tensors.push_back(activation_tensors[input_name]);
@@ -235,6 +279,12 @@ protected:
             op_->execute(input_tensors, output_tensors);
             break;
         }
+        case TENSOR_STATIC_TRACE : {
+            if (backend_->type() == BackendType::MLLM_CPU) {
+                Tracer::addOp(op_, input_tensors, output_tensors);
+            }
+            break;
+        }
         default: {
             break;
         }
@@ -254,7 +304,8 @@ protected:
                     default: {
                     }
                     }
-                    if (activation_tensors_num[input_tensor->name()] == 0 && activation_tensors[input_tensor->name()]->sequence() > 1) {
+                    if (activation_tensors_num[input_tensor->name()] == 0 && activation_tensors[input_tensor->name()]->sequence() > 1
+                        && activation_tensors[input_tensor->name()]->ttype()!= GRAPH_OUTPUT) {
                         activation_tensors[input_tensor->name()]->free();
                         // std::cout << input_tensor->name() << "|" << std::endl;
                     }
@@ -293,6 +344,20 @@ public:
         param_["out_features"] = out_features;
         param_["bias"] = (float)bias;
         init(std::move(name), OpType::LINEAR);
+    }
+    Tensor &operator()(Tensor &input) {
+        auto ts = run({input}, 1);
+        return ts[0].get();
+    }
+};
+
+class HeadLinear final : public Layer {
+public:
+    explicit HeadLinear(int in_features, int out_features, bool bias, std::string name) {
+        param_["in_features"] = in_features;
+        param_["out_features"] = out_features;
+        param_["bias"] = (float)bias;
+        init(std::move(name), OpType::HEADLINEAR);
     }
     Tensor &operator()(Tensor &input) {
         auto ts = run({input}, 1);
@@ -506,9 +571,51 @@ public:
     }
 };
 
+typedef std::unordered_map<string, std::any> RoPEConfig;
+
 class RoPE final : public Layer {
 public:
     RoPE() = default;
+
+    explicit RoPE(int pose_type, const RoPEConfig & config, std::string name) {
+        param_["pose_type"] = pose_type;
+        auto it_rope_theta = config.find("rope_theta");
+        if (it_rope_theta != config.end()) {
+            param_["rope_theta"] = std::any_cast<float>(it_rope_theta->second);
+        }
+
+        auto it_max_position_embeddings = config.find("max_position_embeddings");
+        if (it_max_position_embeddings != config.end()) {
+            param_["max_position_embeddings"] = std::any_cast<int>(it_max_position_embeddings->second);
+        }
+
+        auto it_partial_rotary_factor = config.find("partial_rotary_factor");
+        if (it_partial_rotary_factor != config.end()) {
+            param_["partial_rotary_factor"] = std::any_cast<float>(it_partial_rotary_factor->second);
+        }
+
+        if (config.find("rope_scaling") != config.end()) {
+            auto rope_scaling = std::any_cast<map<string, std::any>>(config.at("rope_scaling"));
+            auto it = rope_scaling.find("rope_type");
+            if (it != rope_scaling.end()) {
+                string rope_type = std::any_cast<string>(it->second);
+                if (rope_type == "default") {
+                    param_["rope_type"] = DEFAULT;
+                } else if (rope_type == "llama3") {
+                    param_["rope_type"] = LLAMA3;
+                    param_["factor"] = std::any_cast<float>(rope_scaling.at("factor"));
+                    param_["high_freq_factor"] = std::any_cast<float>(rope_scaling.at("high_freq_factor"));
+                    param_["low_freq_factor"] = std::any_cast<float>(rope_scaling.at("low_freq_factor"));
+                    param_["original_max_position_embeddings"] = std::any_cast<int>(rope_scaling.at("original_max_position_embeddings"));
+                } else {
+                    std::cout << "[TODO]rope type " << rope_type << " not support!!!!" << std::endl;
+                }
+            }
+        }
+
+        init(std::move(name), OpType::ROPE);
+    }
+
     explicit RoPE(int pose_type, std::string name) {
         param_["pose_type"] = pose_type;
         init(std::move(name), OpType::ROPE);
@@ -655,33 +762,7 @@ public:
         return ts[0].get();
     }
 };
-/*
-class Split final : public Layer {
-public:
-    Split() = default;
 
-    explicit Split(int split_num, Chl split_dim, int split_dim_size, std::string name) {
-        param_["split_num"] = (float)split_num;
-        param_["split_dim"] = (float)split_dim;
-        param_["split_dim_size"] = (float)split_dim_size;
-        init(std::move(name), OpType::SPLIT);
-    }
-
-    explicit Split(const std::vector<int> &each_dims, Chl split_dim, const std::string &name) {
-        param_["split_num"] = (float)each_dims.size();
-        param_["split_dim"] = (float)split_dim;
-        // store each dims
-        for (size_t i = 0; i < each_dims.size(); ++i) {
-            param_["split_dim_size_" + std::to_string(i)] = (float)each_dims[i];
-        }
-        init(std::move(name), OpType::SPLIT);
-    }
-
-    vector<std::reference_wrapper<Tensor>> operator()(Tensor &input) {
-        return run({input}, (int)param_["split_num"]);
-    }
-};
-*/
 class Convolution2D final : public Layer {
 public:
     explicit Convolution2D(int in_channel, int out_channel, vector<int> kernal, vector<int> stride, PaddingType padding, bool bias, std::string name) {
@@ -722,15 +803,35 @@ public:
     }
 };
 
-class Concat final : public Layer {
+class VisionRoPE final : public Layer {
 public:
-    explicit Concat(Chl axis, std::string name) {
-        param_["axis"] = (float)axis;
-        init(std::move(name), OpType::CAT);
+    explicit VisionRoPE(int dim_size, int spatial_merge_size, std::string name) {
+        param_["dim"] = (float)dim_size;
+        param_["spatial_merge_size"] = (float)spatial_merge_size;
+        init(std::move(name), OpType::VISIONROPE);
     }
-    Tensor &operator()(Tensor &input0, Tensor &input1) {
-        auto ts = run({input0, input1}, 1);
+    Tensor &operator()(Tensor &input) {
+        auto ts = run({input}, 1);
         return ts[0].get();
+    }
+};
+class MultimodalRoPE final : public Layer {
+public:
+    MultimodalRoPE() = default;
+    explicit MultimodalRoPE(float rope_theta, int max_position_embeddings, vector<int> mrope_section, std::string name) {
+        param_["rope_theta"] = rope_theta;
+        param_["max_position_embeddings"] = max_position_embeddings;
+        for (int i = 0; i < mrope_section.size(); i++) {
+            param_["mrope_section_" + std::to_string(i)] = (float)mrope_section[i];
+        }
+        init(std::move(name), OpType::MULTIMODALROPE);
+    }
+    Tensor &operator()(Tensor &input, Tensor &position_ids) {
+        auto ts = run({input, position_ids}, 1);
+        return ts[0].get();
+    }
+    void clearCache() {
+        return op_->clearCache();
     }
 };
 
@@ -760,6 +861,17 @@ public:
         return ts[0].get();
     }
 };
+
+
+
+
+
+
+
+
+
+
+
 
 //  Only for QNN START
 
@@ -964,6 +1076,30 @@ public:
     // Q, K, V
     Tensor &operator()(Tensor &Q, Tensor &K, Tensor &V) {
         auto ts = run({Q, K, V}, 1); // Q, K, V
+        return ts[0].get();
+    }
+};
+
+class NTKRoPE final : public Layer {
+public:
+    NTKRoPE(RoPEType type, float theta, int max_position_embeddings, int original_max_position_embeddings, const std::vector<float> &long_factor, const std::vector<float> &short_factor, std::string name) {
+        init(std::move(name), OpType::NTKROPE);
+        param_["pose_type"] = (float)type;
+        param_["theta"] = theta;
+        param_["max_position_embeddings"] = (float)max_position_embeddings;
+        param_["original_max_position_embeddings"] = (float)original_max_position_embeddings;
+        param_["long_factor_n"] = (float)long_factor.size();
+        for (int i = 0; i < long_factor.size(); i++) {
+            param_["long_factor_" + std::to_string(i)] = long_factor[i];
+        }
+        param_["short_factor_n"] = (float)short_factor.size();
+        for (int i = 0; i < short_factor.size(); i++) {
+            param_["short_factor_" + std::to_string(i)] = short_factor[i];
+        }
+    }
+
+    Tensor &operator()(Tensor &input) {
+        auto ts = run({input}, 1);
         return ts[0].get();
     }
 };

@@ -21,7 +21,25 @@ public:
         int dim_h = inputs[0]->head();
         int dim_s = inputs[0]->sequence();
         int dim_d = inputs[0]->dimension();
-        if (b == -1 && h != -1 && s == -1 && d != -1) { // head & dimension
+        if (b == -1 && h == 1 && s == 1 && d == -1) { //  sequence & head & dimension -> dimension
+            dim_s = 1;
+            dim_h = 1;
+            dim_d = inputs[0]->sequence() * inputs[0]->head() * inputs[0]->dimension();
+        } else if (b == -1 && h == -1 && s == 1 && d == 1) { //  sequence & head & dimension -> sequence
+            dim_s = inputs[0]->sequence() * inputs[0]->head() * inputs[0]->dimension();
+            dim_h = 1;
+            dim_d = 1;
+        } else if (b == 1 && h == 1 && s == -1 && d != -1 && inputs[0]->ctype() == BCTHW) { //  batch & head & sequence -> sequence
+            dim_b = 1;
+            dim_s = inputs[0]->channel() * inputs[0]->time() * inputs[0]->batch()* inputs[0]->height() *inputs[0]->width() /d;
+            dim_h = 1;
+            dim_d = d;
+        } else if (b == 1 && h == 1 && s == -1 && d != -1) { //  batch & head & sequence -> sequence
+            dim_b = 1;
+            dim_s = inputs[0]->sequence() * inputs[0]->batch()* inputs[0]->head() *inputs[0]->dimension() /d;
+            dim_h = 1;
+            dim_d = d;
+        } else if (b == -1 && h != -1 && s == -1 && d != -1) { // head & dimension
             if (h != ANYDIM && d != ANYDIM) {
                 assert(inputs[0]->dimension() * inputs[0]->head() == h * d);
                 dim_h = h;
@@ -67,18 +85,22 @@ public:
             std::cout << "[TODO]Tensor.View not support!!!!" << std::endl;
         }
         outputs[0]->reshape(dim_b, dim_h, dim_s, dim_d);
-        if ((b == -1 && s == -1 && inputs[0]->ctype() != BCTHW)   // head & dimension
-            || (b == -1 && d == -1 && inputs[0]->ctype() == BSHD) // head & sequence
-            || (h == -1 && d == -1 && inputs[0]->ctype() == BSHD) // batch & sequence
+        if ((b == -1 && s == -1 && inputs[0]->ctype() != BCTHW)                       // head & dimension
+            || (b == 1 && h == 1 && inputs[0]->ctype() == BCTHW)                       // head & dimension
+            || (b == 1 && h == 1 && inputs[0]->ctype() == BSHD)                       // head & dimension
+            || (b == -1 && d == -1 && inputs[0]->ctype() == BSHD)                     // head & sequence
+            || (h == -1 && d == -1 && inputs[0]->ctype() == BSHD)                     // batch & sequence
+            || (b == -1 && h == 1 && s == 1 && d == -1 && inputs[0]->ctype() == BSHD) //  sequence & head & dimension -> dimension
+            || (b == -1 && h == -1 && s == 1 && d == 1 && inputs[0]->ctype() == BSHD) //  sequence & head & dimension -> sequence
         ) {
             if (inputs[0]->masterTensor() == nullptr) {
                 inputs[0]->free();
             }
             outputs[0]->setDtype(inputs[0]->dtype());
             outputs[0]->alloc();
-            inputs[0]->deepCopyFrom(outputs[0], false);
+            inputs[0]->shallowCopyFrom(outputs[0], false);
         } else {
-            std::cout << "[TODO]Tensor.View not support!!!!" << std::endl;
+            std::cout << "[TODO]Tensor.View alloc not support!!!!" << std::endl;
         }
     }
     void execute(vector<Tensor *> outputs, vector<Tensor *> inputs, vector<float> args) override {

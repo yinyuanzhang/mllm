@@ -104,7 +104,7 @@ private:
     //  used for AggregatedTensor
     bool aggregated_ = false;
     vector<shared_ptr<Tensor>> aggregated_tensors_;
-    Tensor *deaggregated_tensor_;
+    Tensor *deaggregated_tensor_ = nullptr;
     Chl aggregated_dim_;
     vector<int> aggregated_dims_;
     Module *module_{};
@@ -137,6 +137,8 @@ public:
     Tensor(int value, Backend *bn);
 
     Tensor(int value, BackendType bn_type = MLLM_CPU);
+
+    Tensor(vector<float> values, BackendType bn_type = MLLM_CPU);
 
     /**
      * \brief reshape 4-D Tensor with four dimensions: [batch, head, sequence, dimension].
@@ -234,7 +236,7 @@ public:
     }
     int legacyShape(int index) const {
         if (index >= numAxes() || index < -numAxes()) {
-            return 1;
+            return 0;
         }
         return shape(index);
     }
@@ -791,6 +793,8 @@ public:
     Tensor &operator/(float data);
     Tensor &operator/(double data);
 
+    Tensor &operator/(int data);
+
     /**
      * \brief Overload the operators.
      * \param other The Other Tensor
@@ -811,6 +815,7 @@ public:
     Tensor &transpose(vector<std::pair<Chl, Chl>> axiss);
     Tensor &clip(vector<int> b, vector<int> h, vector<int> s, vector<int> d);
     Tensor &clip(Chl keep_axis, vector<int> b, vector<int> h, vector<int> s, vector<int> d);
+    Tensor &clip(Tensor &index, Chl dim);
     Tensor &expand(int b, int h, int s, int d);
     static Tensor &cat(vector<Tensor> input_tensors, Chl dims);
     static Tensor &mm(Tensor &input0, Tensor &input1);
@@ -822,13 +827,21 @@ public:
         return split(*this, each_dims, split_dim, same_dim_size);
     }
     Tensor &index_put(Tensor &value, Tensor &indices, bool accumulate);
+    void scatter_reduce(Tensor &value, Tensor &indices);
+    static vector<std::reference_wrapper<Tensor>> topk(Tensor &input, int k, Chl dim);
+    Tensor &sum(Chl dim);
+    Tensor &argsort();
+    Tensor &bincount();
+    Tensor &repeat(Chl dim, int dim_size);
+    static Tensor &zero_like(Tensor &input);
+    static Tensor &apply_rotary_pos_emb_vision(Tensor &input, Tensor&rotary_pos_emb);
 
     // models use only
     static Tensor &fuyu_gather_embd(Tensor &word, Tensor &image_patches, Tensor &image_patches_indices);
     static Tensor &phi3v_hd_merge(Tensor &input, int h_crop, int w_crop);
 
     /* Functions used for ChildTensor:
-     * - deepCopyFrom
+     * - shallowCopyFrom
      * - shape_offset
      * - shape_master
      * - masterTensor
@@ -844,7 +857,7 @@ public:
      * \param head_rep the repeat number of heads of ChildTensor compared to MasterTensor.
      *                 used for repeat the head of K/V in Transformer-based LLMs. Default is 1.
      */
-    void deepCopyFrom(Tensor *source, bool copyshape = true, const vector<int> &shape_offset = {}, int head_rep = 1) {
+    void shallowCopyFrom(Tensor *source, bool copyshape = true, const vector<int> &shape_offset = {}, int head_rep = 1) {
         if (!shape_offset.empty()) {
             copyshape = false;
         }
@@ -963,18 +976,18 @@ public:
                 if (!shape_offset.empty()) {
                     origin_shape_offset[2] = shape_offset[2];
                 }
-                child_tensor->deepCopyFrom(source, false, origin_shape_offset, head_rep);
+                child_tensor->shallowCopyFrom(source, false, origin_shape_offset, head_rep);
             } else if (!shape_offset.empty()) {
-                child_tensor->deepCopyFrom(source, false, shape_offset, head_rep);
+                child_tensor->shallowCopyFrom(source, false, shape_offset, head_rep);
             } else {
-                child_tensor->deepCopyFrom(source, false, {}, head_rep);
+                child_tensor->shallowCopyFrom(source, false, {}, head_rep);
             }
             it = child_tensors_.erase(it);
         }
         source->addChildTensor(this);
     }
-    void deepCopyFrom(Tensor &source, bool copyshape = true, const vector<int> &shape_offset = {}, int head_rep = 1) {
-        deepCopyFrom(&source, copyshape, shape_offset, head_rep);
+    void shallowCopyFrom(Tensor &source, bool copyshape = true, const vector<int> &shape_offset = {}, int head_rep = 1) {
+        shallowCopyFrom(&source, copyshape, shape_offset, head_rep);
     }
 
     vector<int> shapeOffset() const {
@@ -1103,7 +1116,9 @@ public:
     Tensor &to(BackendType backend_type);
     static vector<Tensor> toDevice(vector<Tensor> inputs, BackendType backend_type) {
         for (auto &input : inputs) {
-            input.to(backend_type);
+            if (input.device() != backend_type) {
+                input.to(backend_type);
+            }
         }
         return inputs;
     };
@@ -1225,372 +1240,6 @@ public:
     void setModule(Module *module) {
         module_ = module;
     }
-
-public:
-    /* Functions used for TEST & DEBUG
-     * - checkData
-     * - printShape
-     * - printData
-     * - saveData
-     * - printMem
-     * - printAVG
-     */
-
-    template <typename Dtype>
-    void checkData() {
-        if (ctype() == BTHWC || ctype() == BCTHW || dtype() != MLLM_TYPE_F32) {
-            return;
-        }
-        // n c h w
-        int N = batch();
-        int C = head();
-        int H = sequence();
-        int W = dimension();
-        bool ck = false;
-        for (int n = 0; n < N; ++n) {
-            for (int c = 0; c < C; ++c) {
-                for (int h = 0; h < H; ++h) {
-                    for (int w = 0; w < W; ++w) {
-                        float value = dataAt<Dtype>(n, c, h, w);
-                        if (std::isnan(value) || std::isnan(-value)) {
-                            // std::cout<<"["<<n<<","<<c<<","<<h<<","<<w<<"] ";//<<std::flush;
-                            ck = true;
-                        }
-                    }
-                }
-            }
-        }
-        if (ck) {
-            std::cout << "\n[ERROR]:" << name() << ": shape:[" << batch() << " " << head() << " " << sequence() << " " << dimension() << "] has Nan" << std::endl;
-            // printData<Dtype>();
-            assert(ck == false);
-        }
-    }
-
-    void printShape() {
-        std::cout << name() << ": shape:[" << batch() << " " << head() << " " << sequence() << " " << dimension() << "]" << std::endl;
-    }
-
-    template <typename Dtype>
-    void printData() {
-        if (ctype() == BTHWC || ctype() == BCTHW) {
-            printData<Dtype>();
-            return;
-        }
-        std::cout << "----------------------------------------" << std::endl;
-        std::cout << name() << ": shape:[" << batch() << " " << head() << " " << sequence() << " " << dimension() << "]" << std::endl;
-        int N = batch();
-        int C = head();
-        int H = sequence();
-        int W = dimension();
-        if (N == 1 && C == 1) {
-            for (int h = 0; h < H; ++h) {
-                for (int c = 0; c < W; ++c) {
-                    std::cout << std::fixed << std::setprecision(7) << static_cast<float>(dataAt<Dtype>(0, 0, h, c)) << " ";
-                }
-                std::cout << std::endl;
-                std::cout << "---------" << std::endl;
-            }
-        } else if (N == 1 && W == 1) {
-            for (int h = 0; h < H; ++h) {
-                for (int c = 0; c < C; ++c) {
-                    std::cout << std::fixed << std::setprecision(7) << static_cast<float>(dataAt<Dtype>(0, c, h, 0)) << " ";
-                }
-                std::cout << std::endl;
-            }
-        } else {
-            for (int n = 0; n < N; ++n) {
-                for (int c = 0; c < C; ++c) {
-                    for (int h = 0; h < H; ++h) {
-                        for (int w = 0; w < W; ++w) {
-                            std::cout << std::fixed << std::setprecision(7) << static_cast<float>(dataAt<Dtype>(n, c, h, w)) << " ";
-                        }
-                        std::cout << std::endl;
-                    }
-                    std::cout << std::endl;
-                }
-                std::cout << std::endl;
-            }
-        }
-    }
-
-    template <typename Dtype>
-    void saveData(string ex = "") {
-        if (ctype() == BTHWC || ctype() == BCTHW) {
-            save5Data<Dtype>(ex);
-            return;
-        }
-        // std::filesystem::create_directory("save_out");
-        string directory = "save_out";
-        struct stat info;
-#ifdef _WIN32
-        _mkdir(directory.c_str());
-#else
-        if (stat(directory.c_str(), &info) != 0) {
-            if (stat(directory.c_str(), &info) != 0) {
-                mkdir(directory.c_str(), 0777); // notice that 0777 is different than usual
-            } else if (!(info.st_mode & S_IFDIR)) {
-                // if the path exists but it is not a directory, also create it
-                mkdir(directory.c_str(), 0777); // notice that 0777 is different than usual
-            }
-        }
-#endif
-        std::ofstream outFile(directory + "/" + name() + ex + ".log");
-        outFile << "----------------------------------------" << std::endl;
-        if (ctype_ == BSHD) {
-            outFile << name() << ": [BSHD]shape:[" << batch() << " " << sequence() << " " << head() << " " << dimension() << "] " << dtype() << " " << ctype() << std::endl;
-        } else {
-            outFile << name() << ": shape:[" << batch() << " " << head() << " " << sequence() << " " << dimension() << "] " << dtype() << " " << ctype() << std::endl;
-        }
-
-        int N = batch();
-        int C = head();
-        int H = sequence();
-        int W = dimension();
-        if (H == 3) {
-            for (int n = 0; n < N; ++n) {
-                for (int h = 0; h < H; ++h) {
-                    for (int c = 0; c < C; ++c) {
-                        for (int w = 0; w < W; ++w) {
-                            outFile << std::fixed << std::setprecision(6) << dataAt<Dtype>(n, c, h, w) << " ";
-                        }
-                        outFile << std::endl;
-                    }
-                    outFile << std::endl;
-                }
-                outFile << std::endl;
-            }
-        } else if (N == 1 && C == 1) {
-            for (int h = 0; h < H; ++h) {
-                for (int c = 0; c < W; ++c) {
-                    outFile << std::fixed << std::setprecision(6) << dataAt<Dtype>(0, 0, h, c) << " ";
-                }
-                outFile << std::endl;
-                outFile << "---------" << std::endl;
-            }
-        } else if (N == 1 && W == 1) {
-            for (int h = 0; h < H; ++h) {
-                for (int c = 0; c < C; ++c) {
-                    outFile << std::fixed << std::setprecision(6) << dataAt<Dtype>(0, c, h, 0) << " ";
-                }
-                outFile << std::endl;
-            }
-        } else {
-            for (int n = 0; n < N; ++n) {
-                for (int c = 0; c < C; ++c) {
-                    for (int h = 0; h < H; ++h) {
-                        for (int w = 0; w < W; ++w) {
-                            outFile << std::fixed << std::setprecision(6) << dataAt<Dtype>(n, c, h, w) << " ";
-                        }
-                        outFile << std::endl;
-                    }
-                    outFile << std::endl;
-                }
-                outFile << std::endl;
-            }
-        }
-
-        outFile.close();
-    }
-
-    template <typename Dtype>
-    void saveNData(string new_name = "", string ex = "") {
-        if (Tensor::tensor_status == TENSOR_STATIC_READY && !shape().empty()) {
-            if (ctype() == BTHWC || ctype() == BCTHW) {
-                save5Data<Dtype>(ex);
-                return;
-            }
-            // std::filesystem::create_directory("save_out");
-            string directory = "save_out";
-            struct stat info;
-
-#ifdef _WIN32
-            _mkdir(directory.c_str());
-#else
-            if (stat(directory.c_str(), &info) != 0) {
-                if (stat(directory.c_str(), &info) != 0) {
-                    mkdir(directory.c_str(), 0777); // notice that 0777 is different than usual
-                } else if (!(info.st_mode & S_IFDIR)) {
-                    // if the path exists but it is not a directory, also create it
-                    mkdir(directory.c_str(), 0777); // notice that 0777 is different than usual
-                }
-            }
-#endif
-            auto tmp_name = name();
-            if (new_name.empty()) {
-            } else {
-                tmp_name = new_name;
-            }
-            std::ofstream outFile(directory + "/" + tmp_name + ex + ".log");
-
-            outFile << "----------------------------------------" << std::endl;
-            if (new_name.empty()) {
-                outFile << name();
-            } else {
-                outFile << new_name;
-            }
-            outFile << ": shape:[" << batch() << " " << sequence() << " " << head() << " " << dimension() << "] " << dtype() << " " << ctype() << std::endl;
-
-            int N = batch();
-            int C = head();
-            int H = sequence();
-            int W = dimension();
-            if (N == 1 && C == 1) {
-                for (int h = 0; h < H; ++h) {
-                    for (int c = 0; c < W; ++c) {
-                        outFile << std::fixed << std::setprecision(6) << dataAt<Dtype>(0, 0, h, c) << " ";
-                    }
-                    outFile << std::endl;
-                    outFile << "---------" << std::endl;
-                }
-            } else if (N == 1 && W == 1) {
-                for (int h = 0; h < H; ++h) {
-                    for (int c = 0; c < C; ++c) {
-                        outFile << std::fixed << std::setprecision(6) << dataAt<Dtype>(0, c, h, 0) << " ";
-                    }
-                    outFile << std::endl;
-                }
-            } else {
-                for (int n = 0; n < N; ++n) {
-                    for (int h = 0; h < H; ++h) {
-                        for (int c = 0; c < C; ++c) {
-                            for (int w = 0; w < W; ++w) {
-                                outFile << std::fixed << std::setprecision(6) << dataAt<Dtype>(n, c, h, w) << " ";
-                            }
-                            outFile << std::endl;
-                        }
-                        outFile << std::endl;
-                    }
-                    outFile << std::endl;
-                }
-            }
-
-            outFile.close();
-        }
-    }
-
-    template <typename Dtype>
-    void print5Data() {
-        std::cout << "----------------------------------------" << std::endl;
-        std::cout << name() << ": shape:[" << batch() << " " << channel() << " " << time() << " " << height() << " " << width() << "]" << std::endl;
-        int N = batch();
-        int C = channel();
-        int T = time();
-        int H = height();
-        int W = height();
-        for (int n = 0; n < N; ++n) {
-            for (int c = 0; c < C; ++c) {
-                for (int t = 0; t < T; ++t) {
-                    for (int h = 0; h < H; ++h) {
-                        for (int w = 0; w < W; ++w) {
-                            std::cout << std::fixed << std::setprecision(7) << dataAt<Dtype>(n, c, t, h, w) << " ";
-                        }
-                        std::cout << std::endl;
-                    }
-                    std::cout << std::endl;
-                }
-                std::cout << std::endl;
-            }
-        }
-    }
-
-    template <typename Dtype>
-    void save5Data(string ex = "") {
-        // std::filesystem::create_directory("save_out");
-        string directory = "save_out";
-        struct stat info;
-
-#ifdef _WIN32
-        _mkdir(directory.c_str());
-#else
-        if (stat(directory.c_str(), &info) != 0) {
-            if (stat(directory.c_str(), &info) != 0) {
-                mkdir(directory.c_str(), 0777); // notice that 0777 is different than usual
-            } else if (!(info.st_mode & S_IFDIR)) {
-                // if the path exists but it is not a directory, also create it
-                mkdir(directory.c_str(), 0777); // notice that 0777 is different than usual
-            }
-        }
-#endif
-        std::ofstream outFile(directory + "/" + name() + ex + ".log");
-        outFile << "----------------------------------------" << std::endl;
-        outFile << name() << ": shape:[" << batch() << " " << channel() << " " << time() << " " << height() << " " << width() << "]" << std::endl;
-        int N = batch();
-        int C = channel();
-        int T = time();
-        int H = height();
-        int W = height();
-        for (int n = 0; n < N; ++n) {
-            for (int c = 0; c < C; ++c) {
-                for (int t = 0; t < T; ++t) {
-                    for (int h = 0; h < H; ++h) {
-                        for (int w = 0; w < W; ++w) {
-                            outFile << std::fixed << std::setprecision(7) << dataAt<Dtype>(n, c, t, h, w) << " ";
-                        }
-                        outFile << std::endl;
-                    }
-                    outFile << std::endl;
-                }
-                outFile << std::endl;
-            }
-        }
-    }
-
-    template <typename Dtype>
-    void printMem() {
-        for (int i = 0; i < count_; ++i) {
-            auto *typed_ptr = static_cast<Dtype *>(host_ptr_);
-            std::cout << std::fixed << std::setprecision(7) << typed_ptr[i] << " ";
-        }
-    }
-
-    template <typename Dtype>
-    void printAVG() {
-        float sum = 0;
-        // n c h w
-        int N = batch();
-        int C = head();
-        int H = sequence();
-        int W = dimension();
-        bool ck = false;
-        for (int n = 0; n < N; ++n) {
-            for (int c = 0; c < C; ++c) {
-                for (int h = 0; h < H; ++h) {
-                    for (int w = 0; w < W; ++w) {
-                        float value = dataAt<Dtype>(n, c, h, w);
-                        sum += value;
-                    }
-                }
-            }
-        }
-        std::cout << name() << " " << sum / count() << std::endl;
-    }
-
-    template <class Dtype>
-    void fullData(Dtype value) {
-        for (int n = 0; n < batch(); ++n) {
-            for (int c = 0; c < head(); ++c) {
-                for (int h = 0; h < sequence(); ++h) {
-                    for (int w = 0; w < dimension(); ++w) {
-                        setDataAt<Dtype>(n, c, h, w, value);
-                    }
-                }
-            }
-        }
-    }
-
-    void fullDataTest() {
-        for (int n = 0; n < batch(); ++n) {
-            for (int c = 0; c < head(); ++c) {
-                for (int h = 0; h < sequence(); ++h) {
-                    for (int w = 0; w < dimension(); ++w) {
-                        setDataAt<float>(n, c, h, w, offset(n, c, h, w));
-                    }
-                }
-            }
-        }
-    }
-
     void transCopyShape(const vector<int> &shape) {
         reshape(shape);
     }
@@ -1735,6 +1384,7 @@ private:
         return tensor_id;
     }
     Tensor &getFunc(const std::string &suffix, TensorFuncType type, vector<float> float_args, vector<Tensor *> other_tensors = {});
+    void getFunc(TensorFuncType type, vector<float> float_args, vector<Tensor *> other_tensors = {});
 
     static std::vector<std::reference_wrapper<Tensor>> getStaticFunc(vector<std::string> out_names, TensorFuncType type, vector<float> float_args, vector<Tensor *> input_tensors);
 
@@ -1745,8 +1395,574 @@ public:
 
     void forceResetHostPointer(void *ptr);
 
-public:
     float i8_scale = 1.f;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+public:
+    /* Functions used for TEST & DEBUG
+     * - checkData
+     * - printShape
+     * - printData
+     * - saveData
+     * - printMem
+     * - printAVG
+     * - printCtype
+     */
+
+    template <typename Dtype>
+    void checkData() {
+        if (ctype() == BTHWC || ctype() == BCTHW || dtype() != MLLM_TYPE_F32) {
+            return;
+        }
+        // n c h w
+        int N = batch();
+        int C = head();
+        int H = sequence();
+        int W = dimension();
+        bool ck = false;
+        for (int n = 0; n < N; ++n) {
+            for (int c = 0; c < C; ++c) {
+                for (int h = 0; h < H; ++h) {
+                    for (int w = 0; w < W; ++w) {
+                        float value = dataAt<Dtype>(n, c, h, w);
+                        if (std::isnan(value) || std::isnan(-value)) {
+                            // std::cout<<"["<<n<<","<<c<<","<<h<<","<<w<<"] ";//<<std::flush;
+                            ck = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (ck) {
+            std::cout << "\n[ERROR]:" << name() << ": shape:[" << batch() << " " << head() << " " << sequence() << " " << dimension() << "] has Nan" << std::endl;
+            // printData<Dtype>();
+            assert(ck == false);
+        }
+    }
+
+    void printShape() {
+        std::cout << name() << ": shape:[" << batch() << " " << head() << " " << sequence() << " " << dimension() << "]" << std::endl;
+    }
+
+    template <typename Dtype>
+    void printDataTorchLike() {
+        if (ctype() == BTHWC || ctype() == BCTHW) {
+            printData<Dtype>();
+            return;
+        }
+
+        std::cout << "----------------------------------------" << std::endl;
+        std::cout << name() << ": shape:[" << batch() << " " << head() << " " << sequence() << " " << dimension() << "]" << std::endl;
+
+        int N = batch();
+        int C = head();
+        int H = sequence();
+        int W = dimension();
+
+        // 每行最多打印的元素数量
+        const int max_elements_per_line = 6;
+        // 最多打印的行数
+        const int max_rows = 6;
+
+        // 递归打印函数
+        auto printRecursive = [&](auto&& self, int n, int c, int h, int w, int depth) -> void {
+            if (depth == 0) {
+                std::cout << "[";
+            }
+
+            if (depth == 3) {
+                // 打印单个元素
+                std::cout << std::fixed << std::setprecision(7) << std::setw(10) << static_cast<float>(dataAt<Dtype>(n, c, h, w)) << " ";
+                if (w == W - 1) {
+                    std::cout << "]";
+                }
+                return;
+            }
+
+            if (depth == 2) {
+                std::cout << "[";
+                if (W > max_elements_per_line) {
+                    int half = max_elements_per_line / 2;
+                    for (int w_idx = 0; w_idx < half; ++w_idx) {
+                        self(self, n, c, h, w_idx, depth + 1);
+                    }
+                    std::cout << "... ";
+                    for (int w_idx = W - half; w_idx < W; ++w_idx) {
+                        self(self, n, c, h, w_idx, depth + 1);
+                    }
+                } else {
+                    for (int w_idx = 0; w_idx < W; ++w_idx) {
+                        self(self, n, c, h, w_idx, depth + 1);
+                    }
+                }
+                std::cout << "]";
+                return;
+            }
+
+            if (depth == 1) {
+                std::cout << "[";
+                if (H > max_rows) {
+                    int half = max_rows / 2;
+                    for (int h_idx = 0; h_idx < half; ++h_idx) {
+                        self(self, n, c, h_idx, 0, depth + 1);
+                        std::cout << std::endl << " ";
+                    }
+                    std::cout << "..." << std::endl << " ";
+                    for (int h_idx = H - half; h_idx < H; ++h_idx) {
+                        self(self, n, c, h_idx, 0, depth + 1);
+                        if (h_idx < H - 1) {
+                            std::cout << std::endl << " ";
+                        }
+                    }
+                } else {
+                    for (int h_idx = 0; h_idx < H; ++h_idx) {
+                        self(self, n, c, h_idx, 0, depth + 1);
+                        if (h_idx < H - 1) {
+                            std::cout << std::endl << " ";
+                        }
+                    }
+                }
+                std::cout << "]";
+                return;
+            }
+
+            if (depth == 0) {
+                for (int c_idx = 0; c_idx < C; ++c_idx) {
+                    self(self, n, c_idx, 0, 0, depth + 1);
+                    if (c_idx < C - 1) {
+                        std::cout << std::endl << std::endl;
+                    }
+                }
+                std::cout << "]";
+                return;
+            }
+        };
+
+        // 打印整个 Tensor
+        for (int n_idx = 0; n_idx < N; ++n_idx) {
+            printRecursive(printRecursive, n_idx, 0, 0, 0, 0);
+            if (n_idx < N - 1) {
+                std::cout << std::endl << std::endl;
+            }
+        }
+    }
+
+    template <typename Dtype>
+    void printData() {
+        if (ctype() == BTHWC || ctype() == BCTHW) {
+            printData<Dtype>();
+            return;
+        }
+        std::cout << "----------------------------------------" << std::endl;
+        std::cout << name() << ": shape:[" << batch() << " " << head() << " " << sequence() << " " << dimension() << "]" << std::endl;
+        int N = batch();
+        int C = head();
+        int H = sequence();
+        int W = dimension();
+        if (N == 1 && C == 1) {
+            for (int h = 0; h < H; ++h) {
+                for (int c = 0; c < W; ++c) {
+                    std::cout << std::fixed << std::setprecision(7) << static_cast<float>(dataAt<Dtype>(0, 0, h, c)) << " ";
+                }
+                std::cout << std::endl;
+                std::cout << "---------" << std::endl;
+            }
+        } else if (N == 1 && W == 1) {
+            for (int h = 0; h < H; ++h) {
+                for (int c = 0; c < C; ++c) {
+                    std::cout << std::fixed << std::setprecision(7) << static_cast<float>(dataAt<Dtype>(0, c, h, 0)) << " ";
+                }
+                std::cout << std::endl;
+            }
+        } else {
+            for (int n = 0; n < N; ++n) {
+                for (int c = 0; c < C; ++c) {
+                    for (int h = 0; h < H; ++h) {
+                        for (int w = 0; w < W; ++w) {
+                            std::cout << std::fixed << std::setprecision(7) << static_cast<float>(dataAt<Dtype>(n, c, h, w)) << " ";
+                        }
+                        std::cout << std::endl;
+                    }
+                    std::cout << std::endl;
+                }
+                std::cout << std::endl;
+            }
+        }
+        std::cout << std::endl;
+    }
+
+    template <typename Dtype>
+    void saveData(string ex = "") {
+        if (ctype() == BTHWC || ctype() == BCTHW) {
+            save5Data<Dtype>(ex);
+            return;
+        }
+        // std::filesystem::create_directory("save_out");
+        string directory = "save_out";
+        struct stat info;
+#ifdef _WIN32
+        _mkdir(directory.c_str());
+#else
+        if (stat(directory.c_str(), &info) != 0) {
+            if (stat(directory.c_str(), &info) != 0) {
+                mkdir(directory.c_str(), 0777); // notice that 0777 is different than usual
+            } else if (!(info.st_mode & S_IFDIR)) {
+                // if the path exists but it is not a directory, also create it
+                mkdir(directory.c_str(), 0777); // notice that 0777 is different than usual
+            }
+        }
+#endif
+        std::ofstream outFile(directory + "/" + name() + ex + ".log");
+        outFile << "----------------------------------------" << std::endl;
+        if (ctype_ == BSHD) {
+            outFile << name() << ": [BSHD]shape:[" << batch() << " " << sequence() << " " << head() << " " << dimension() << "] " << dtype() << " " << ctype() << std::endl;
+        } else {
+            outFile << name() << ": shape:[" << batch() << " " << head() << " " << sequence() << " " << dimension() << "] " << dtype() << " " << ctype() << std::endl;
+        }
+
+        int N = batch();
+        int C = head();
+        int H = sequence();
+        int W = dimension();
+        if (ctype_ == BSHD) {
+            for (int n = 0; n < batch(); ++n) {
+                for (int h = 0; h < sequence(); ++h) {
+                    for (int c = 0; c < head(); ++c) {
+                        for (int w = 0; w < dimension(); ++w) {
+                            outFile << std::fixed << std::setprecision(6) << dataAt<Dtype>(n, c, h, w) << " ";
+                        }
+                        outFile << std::endl;
+                    }
+                    outFile << std::endl;
+                }
+                outFile << std::endl;
+            }
+            outFile.close();
+            return;
+        }
+        if (H == 3) {
+            for (int n = 0; n < N; ++n) {
+                for (int h = 0; h < H; ++h) {
+                    for (int c = 0; c < C; ++c) {
+                        for (int w = 0; w < W; ++w) {
+                            outFile << std::fixed << std::setprecision(6) << dataAt<Dtype>(n, c, h, w) << " ";
+                        }
+                        outFile << std::endl;
+                    }
+                    outFile << std::endl;
+                }
+                outFile << std::endl;
+            }
+        } else if (N == 1 && C == 1) {
+            for (int h = 0; h < H; ++h) {
+                for (int c = 0; c < W; ++c) {
+                    outFile << std::fixed << std::setprecision(6) << dataAt<Dtype>(0, 0, h, c) << " ";
+                }
+                outFile << std::endl;
+                outFile << "---------" << std::endl;
+            }
+        } else if (N == 1 && W == 1) {
+            for (int h = 0; h < H; ++h) {
+                for (int c = 0; c < C; ++c) {
+                    outFile << std::fixed << std::setprecision(6) << dataAt<Dtype>(0, c, h, 0) << " ";
+                }
+                outFile << std::endl;
+            }
+        } else {
+            for (int n = 0; n < N; ++n) {
+                for (int c = 0; c < C; ++c) {
+                    for (int h = 0; h < H; ++h) {
+                        for (int w = 0; w < W; ++w) {
+                            outFile << std::fixed << std::setprecision(6) << dataAt<Dtype>(n, c, h, w) << " ";
+                        }
+                        outFile << std::endl;
+                    }
+                    outFile << std::endl;
+                }
+                outFile << std::endl;
+            }
+        }
+
+        outFile.close();
+    }
+
+    template <typename Dtype>
+    void saveNData(string new_name = "", string ex = "") {
+        if (Tensor::tensor_status == TENSOR_STATIC_READY && !shape().empty()) {
+            if (ctype() == BTHWC || ctype() == BCTHW) {
+                save5Data<Dtype>(ex);
+                return;
+            }
+            // std::filesystem::create_directory("save_out");
+            string directory = "save_out";
+            struct stat info;
+
+#ifdef _WIN32
+            _mkdir(directory.c_str());
+#else
+            if (stat(directory.c_str(), &info) != 0) {
+                if (stat(directory.c_str(), &info) != 0) {
+                    mkdir(directory.c_str(), 0777); // notice that 0777 is different than usual
+                } else if (!(info.st_mode & S_IFDIR)) {
+                    // if the path exists but it is not a directory, also create it
+                    mkdir(directory.c_str(), 0777); // notice that 0777 is different than usual
+                }
+            }
+#endif
+            auto tmp_name = name();
+            if (new_name.empty()) {
+            } else {
+                tmp_name = new_name;
+            }
+            std::ofstream outFile(directory + "/" + tmp_name + ex + ".log");
+
+            outFile << "----------------------------------------" << std::endl;
+            if (new_name.empty()) {
+                outFile << name();
+            } else {
+                outFile << new_name;
+            }
+            if (ctype_ == BSHD) {
+                outFile << name() << ": [BSHD]shape:[" << batch() << " " << sequence() << " " << head() << " " << dimension() << "] " << dtype() << " " << ctype() << std::endl;
+                for (int n = 0; n < batch(); ++n) {
+                    for (int h = 0; h < sequence(); ++h) {
+                        for (int c = 0; c < head(); ++c) {
+                            for (int w = 0; w < dimension(); ++w) {
+                                outFile << std::fixed << std::setprecision(6) << dataAt<Dtype>(n, c, h, w) << " ";
+                            }
+                            outFile << std::endl;
+                        }
+                        outFile << std::endl;
+                    }
+                    outFile << std::endl;
+                }
+                outFile.close();
+                return;
+            } 
+            outFile << name() << ": shape:[" << batch() << " " << head() << " " << sequence() << " " << dimension() << "] " << dtype() << " " << ctype() << std::endl;
+            int N = batch();
+            int C = head();
+            int H = sequence();
+            int W = dimension();
+            if (N == 1 && C == 1) {
+                for (int h = 0; h < H; ++h) {
+                    for (int c = 0; c < W; ++c) {
+                        outFile << std::fixed << std::setprecision(6) << dataAt<Dtype>(0, 0, h, c) << " ";
+                    }
+                    outFile << std::endl;
+                    outFile << "---------" << std::endl;
+                }
+            } else if (N == 1 && W == 1) {
+                for (int h = 0; h < H; ++h) {
+                    for (int c = 0; c < C; ++c) {
+                        outFile << std::fixed << std::setprecision(6) << dataAt<Dtype>(0, c, h, 0) << " ";
+                    }
+                    outFile << std::endl;
+                }
+            } else {
+                for (int n = 0; n < N; ++n) {
+                    for (int h = 0; h < H; ++h) {
+                        for (int c = 0; c < C; ++c) {
+                            for (int w = 0; w < W; ++w) {
+                                outFile << std::fixed << std::setprecision(6) << dataAt<Dtype>(n, c, h, w) << " ";
+                            }
+                            outFile << std::endl;
+                        }
+                        outFile << std::endl;
+                    }
+                    outFile << std::endl;
+                }
+            }
+
+            outFile.close();
+        }
+    }
+
+    template <typename Dtype>
+    void print5Data() {
+        std::cout << "----------------------------------------" << std::endl;
+        std::cout << name() << ": shape:[" << batch() << " " << channel() << " " << time() << " " << height() << " " << width() << "]" << std::endl;
+        int N = batch();
+        int C = channel();
+        int T = time();
+        int H = height();
+        int W = height();
+        for (int n = 0; n < N; ++n) {
+            for (int c = 0; c < C; ++c) {
+                for (int t = 0; t < T; ++t) {
+                    for (int h = 0; h < H; ++h) {
+                        for (int w = 0; w < W; ++w) {
+                            std::cout << std::fixed << std::setprecision(7) << dataAt<Dtype>(n, c, t, h, w) << " ";
+                        }
+                        std::cout << std::endl;
+                    }
+                    std::cout << std::endl;
+                }
+                std::cout << std::endl;
+            }
+        }
+    }
+
+    template <typename Dtype>
+    void save5Data(string ex = "") {
+        // std::filesystem::create_directory("save_out");
+        string directory = "save_out";
+        struct stat info;
+
+#ifdef _WIN32
+        _mkdir(directory.c_str());
+#else
+        if (stat(directory.c_str(), &info) != 0) {
+            if (stat(directory.c_str(), &info) != 0) {
+                mkdir(directory.c_str(), 0777); // notice that 0777 is different than usual
+            } else if (!(info.st_mode & S_IFDIR)) {
+                // if the path exists but it is not a directory, also create it
+                mkdir(directory.c_str(), 0777); // notice that 0777 is different than usual
+            }
+        }
+#endif
+        std::ofstream outFile(directory + "/" + name() + ex + ".log");
+        outFile << "----------------------------------------" << std::endl;
+        outFile << name() << ": shape:[" << batch() << " " << channel() << " " << time() << " " << height() << " " << width() << "]" << std::endl;
+        int N = batch();
+        int C = channel();
+        int T = time();
+        int H = height();
+        int W = height();
+        for (int n = 0; n < N; ++n) {
+            for (int c = 0; c < C; ++c) {
+                for (int t = 0; t < T; ++t) {
+                    for (int h = 0; h < H; ++h) {
+                        for (int w = 0; w < W; ++w) {
+                            outFile << std::fixed << std::setprecision(7) << dataAt<Dtype>(n, c, t, h, w) << " ";
+                        }
+                        outFile << std::endl;
+                    }
+                    outFile << std::endl;
+                }
+                outFile << std::endl;
+            }
+        }
+    }
+
+    template <typename Dtype>
+    void printMem() {
+        for (int i = 0; i < count_; ++i) {
+            auto *typed_ptr = static_cast<Dtype *>(host_ptr_);
+            std::cout << std::fixed << std::setprecision(7) << typed_ptr[i] << " ";
+        }
+    }
+
+    template <typename Dtype>
+    void printAVG() {
+        float sum = 0;
+        // n c h w
+        int N = batch();
+        int C = head();
+        int H = sequence();
+        int W = dimension();
+        bool ck = false;
+        for (int n = 0; n < N; ++n) {
+            for (int c = 0; c < C; ++c) {
+                for (int h = 0; h < H; ++h) {
+                    for (int w = 0; w < W; ++w) {
+                        float value = dataAt<Dtype>(n, c, h, w);
+                        sum += value;
+                    }
+                }
+            }
+        }
+        std::cout << name() << " " << sum / count() << std::endl;
+    }
+
+    void printCtype() {
+        std::string ctype;
+        switch (ctype_) {
+        case BSHD:
+            ctype = "BSHD";
+            break;
+        case BHDS:
+            ctype = "BHDS";
+            break;
+        case BCTHW:
+            ctype = "BCTHW";
+            break;
+        case BTHWC:
+            ctype = "BTHWC";
+            break;
+        case BWCTH:
+            ctype = "BWCTH";
+            break;
+        case SBHD:
+            ctype = "SBHD";
+            break;
+        case BDHS:
+            ctype = "BDHS";
+            break;
+        case BDSH:
+            ctype = "BDSH";
+            break;
+        case DBHS:
+            ctype = "DBHS";
+            break;
+        }
+        std::cout << name() << ": ctype:[" << ctype << "]" << std::endl;
+    }
+
+    template <class Dtype>
+    void fullData(Dtype value) {
+        for (int n = 0; n < batch(); ++n) {
+            for (int c = 0; c < head(); ++c) {
+                for (int h = 0; h < sequence(); ++h) {
+                    for (int w = 0; w < dimension(); ++w) {
+                        setDataAt<Dtype>(n, c, h, w, value);
+                    }
+                }
+            }
+        }
+    }
+
+    void fullDataVector(vector<int> values) {
+        reshape(1, 1, values.size(), 1);
+        alloc();
+        for (int n = 0; n < batch(); ++n) {
+            for (int c = 0; c < head(); ++c) {
+                for (int h = 0; h < sequence(); ++h) {
+                    for (int w = 0; w < dimension(); ++w) {
+                        setDataAt<float>(n, c, h, w, values[h]);
+                    }
+                }
+            }
+        }
+    }
+
+    void fullDataTest() {
+        for (int n = 0; n < batch(); ++n) {
+            for (int c = 0; c < head(); ++c) {
+                for (int h = 0; h < sequence(); ++h) {
+                    for (int w = 0; w < dimension(); ++w) {
+                        setDataAt<float>(n, c, h, w, offset(n, c, h, w));
+                    }
+                }
+            }
+        }
+    }
+
 };
 } // namespace mllm
 #endif // MLLM_TENSOR_H

@@ -49,8 +49,6 @@ int main(int argc, char **argv) {
         auto in_str = in_strs[i];
         in_str = processor.tokenizer->apply_chat_template(in_str);
         auto input_tensor = processor.process(in_str, in_imgs[i]);
-        input_tensor[1].saveData<float>();
-        input_tensor[2].saveData<float>();
         std::cout << "[Q] " << in_strs[i] << std::endl;
         std::cout << "[A] " << std::flush;
         data_preprocessing_end_time = std::chrono::high_resolution_clock::now();

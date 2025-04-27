@@ -20,7 +20,7 @@ public:
             if (inputs[0]->masterTensor() == nullptr) {
                 inputs[0]->free();
             }
-            inputs[0]->deepCopyFrom(outputs[0], false);
+            inputs[0]->shallowCopyFrom(outputs[0], false);
             outputs[0]->alloc();
             return;
         }
@@ -48,7 +48,7 @@ public:
                 inputs[0]->free();
             }
             outputs[0]->alloc();
-            inputs[0]->deepCopyFrom(outputs[0], false);
+            inputs[0]->shallowCopyFrom(outputs[0], false);
         } else {
             outputs[0]->alloc();
         }
@@ -95,6 +95,13 @@ public:
             auto src_ptr = inputs[0]->ptrAt<float>(0, 0, in0_d, 0);
             memcpy(dst_ptr, src_ptr, sizeof(float) * dest_input->dimension() * (outputs[0]->sequence() - start_dest_seq));
         } else if (replace_idx->dimension() == src_input->sequence()) {
+            for (int r_idx = 0; r_idx < replace_idx->dimension(); r_idx++) {
+                auto replace_seq = (int)replace_idx->dataAt<float>(0, 0, 0, r_idx);
+                auto dst_ptr = outputs[0]->ptrAt<float>(0, 0, replace_seq, 0);
+                auto src_ptr = src_input->ptrAt<float>(0, 0, r_idx, 0);
+                memcpy(dst_ptr, src_ptr, sizeof(float) * src_input->dimension());
+            }
+        } else {
             for (int r_idx = 0; r_idx < replace_idx->dimension(); r_idx++) {
                 auto replace_seq = (int)replace_idx->dataAt<float>(0, 0, 0, r_idx);
                 auto dst_ptr = outputs[0]->ptrAt<float>(0, 0, replace_seq, 0);

@@ -29,9 +29,7 @@ Tensor::Tensor(int batch, int head, int sequence, int dimension, Backend *bn, bo
 
 Tensor::Tensor(int batch, int head, int sequence, int dimension, BackendType bn_type,
                bool do_alloc) {
-    setBackend(Backend::global_backends[bn_type]);
-    reshape(batch, head, sequence, dimension);
-    if (do_alloc) { alloc(); }
+    Tensor(batch, head, sequence, dimension, Backend::global_backends[bn_type], do_alloc);
 }
 
 Tensor::Tensor(const vector<int> &shape) :
@@ -55,6 +53,17 @@ Tensor::Tensor(int value, BackendType bn_type) {
     alloc();
     shouldInGraphs() = false;
     setDataAt<float>(0, 0, 0, 0, (float)value);
+}
+
+Tensor::Tensor(vector<float> values, BackendType bn_type) {
+    dtype_ = MLLM_TYPE_F32;
+    setBackend(Backend::global_backends[bn_type]);
+    reshape(1, 1, 1, values.size());
+    alloc();
+    shouldInGraphs() = false;
+    for (auto value : values) {
+        setDataAt<float>(0, 0, 0, 0, (float)value);
+    }
 }
 
 bool Tensor::reshape(const int batch, const int head, const int sequence, const int dimension) {
@@ -187,6 +196,12 @@ Tensor &Tensor::getFunc(const std::string &suffix, const TensorFuncType type,
         func->execute({module_tensors[next_name].get()}, tensorPtrs, float_args);
         break;
     }
+    case TENSOR_STATIC_TRACE: {
+        if (backend_->type() == BackendType::MLLM_CPU) {
+            Tracer::addTensorFunction(func, tensorPtrs, {module_tensors[next_name].get()}, float_args);
+        }
+        break;
+    }
     default: {
     }
     }
@@ -205,7 +220,8 @@ Tensor &Tensor::getFunc(const std::string &suffix, const TensorFuncType type,
                 default: {
                 }
                 }
-                if (activation_tensors_num[input_tensor->name()] == 0 && module_tensors[input_tensor->name()]->sequence() > 1) {
+                if (activation_tensors_num[input_tensor->name()] == 0 && module_tensors[input_tensor->name()]->sequence() > 1 
+                    && module_tensors[input_tensor->name()]->ttype()!= GRAPH_OUTPUT) {
                     module_tensors[input_tensor->name()]->free();
                     // std::cout << input_tensor->name() << " |F" << std::endl;
                 }
@@ -222,12 +238,65 @@ Tensor &Tensor::getFunc(const std::string &suffix, const TensorFuncType type,
 #ifdef DEBUGSAVETENSOR
     module_tensors[next_name]->saveNData<float>();
 #endif
+    return *module_tensors[next_name];
+}
+
+void Tensor::getFunc(const TensorFuncType type,
+                     vector<float> float_args, vector<Tensor *> other_tensors) {
+    assert(module() != nullptr);
+    auto &module_tensors = module()->activation_tensors;
+    auto &activation_tensors_num = module()->activation_tensors_num;
+    if (module()->doLoad) { return; }
+    TensorFunction *func = backend_->funcCreate(type);
+    std::vector<Tensor *> tensorPtrs = {module_tensors[name_].get()};
+    for (auto &other_tensor : other_tensors) { tensorPtrs.push_back(other_tensor); }
+#ifdef DEBUGOPTIME
+    auto start_t = mllm_time_us();
+#endif
+    switch (Tensor::tensor_status) {
+    case TENSOR_STATIC_INIT: {
+        func->setup({}, tensorPtrs, float_args);
+        break;
+    }
+    case TENSOR_STATIC_READY: {
+        func->execute({}, tensorPtrs, float_args);
+        break;
+    }
+    default: {
+    }
+    }
+    if (Backend::global_backends.size() == 1) {
+        for (auto input_tensor : tensorPtrs) {
+            if (activation_tensors_num.find(input_tensor->name()) != activation_tensors_num.end()
+                // && input_tensor->dimension() * input_tensor->sequence() > 0
+            ) {
+                switch (Tensor::tensor_status) {
+                case TENSOR_STATIC_INIT: {
+                    activation_tensors_num[input_tensor->name()] += 1;
+                    break;
+                }
+                case TENSOR_STATIC_READY: {
+                    activation_tensors_num[input_tensor->name()] -= 1;
+                    break;
+                }
+                default: {
+                }
+                }
+                if (activation_tensors_num[input_tensor->name()] == 0 && module_tensors[input_tensor->name()]->sequence() > 1
+                    && module_tensors[input_tensor->name()]->ttype()!= GRAPH_OUTPUT) {
+                    module_tensors[input_tensor->name()]->free();
+                    // std::cout << input_tensor->name() << " |F" << std::endl;
+                }
+            }
+        }
+    }
 #ifdef DEBUGOPTIME
     if (Tensor::tensor_status == TENSOR_STATIC_READY) {
-        std::cout << module_tensors[next_name]->name() << std::endl;
+        auto end_t = mllm_time_us();
+        std::cout << " | " << Tensor::tensor_status
+                  << " time: " << (end_t - start_t) / 1000.0F << "ms" << std::endl;
     }
 #endif
-    return *module_tensors[next_name];
 }
 
 std::vector<std::reference_wrapper<Tensor>> Tensor::getStaticFunc(vector<std::string> out_names,
@@ -277,6 +346,12 @@ std::vector<std::reference_wrapper<Tensor>> Tensor::getStaticFunc(vector<std::st
         func->execute(outPtrs, input_tensors, float_args);
         break;
     }
+    case TENSOR_STATIC_TRACE: {
+        if (backend_h->type() == BackendType::MLLM_CPU) {
+            Tracer::addTensorFunction(func, input_tensors, outPtrs, float_args);
+        }
+        break;
+    }
     default: {
     }
     }
@@ -295,7 +370,8 @@ std::vector<std::reference_wrapper<Tensor>> Tensor::getStaticFunc(vector<std::st
                 default: {
                 }
                 }
-                if (activation_tensors_num[input_tensor->name()] == 0 && module_tensors[input_tensor->name()]->sequence() > 1) {
+                if (activation_tensors_num[input_tensor->name()] == 0 && module_tensors[input_tensor->name()]->sequence() > 1
+                    && module_tensors[input_tensor->name()]->ttype()!= GRAPH_OUTPUT) {
                     module_tensors[input_tensor->name()]->free();
                     // std::cout << input_tensor->name() << " |S "<< std::endl;// << out_names[0] << std::endl;
                 }
@@ -335,6 +411,10 @@ Tensor &Tensor::operator/(float data) {
 
 Tensor &Tensor::operator/(double data) {
     return getFunc("div", FUNC_DIV, {static_cast<float>(data)});
+}
+
+Tensor &Tensor::operator/(int data) {
+    return getFunc("div", FUNC_DIVINT, {static_cast<float>(data)});
 }
 
 Tensor &Tensor::operator+(Tensor &other) {
@@ -385,8 +465,10 @@ Tensor &Tensor::clip(vector<int> b, vector<int> h, vector<int> s, vector<int> d)
     for (auto &axis : s) { axis_s.push_back((float)axis); }
     for (auto &axis : d) { axis_s.push_back((float)axis); }
     string name = "clip-";
-    for (auto as : axis_s) {
-        name += std::to_string(int(as)) + "_";
+    if (!(d.size() == 2 && b.empty() && h.empty() && s.empty())) {
+        for (auto as : axis_s) {
+            name += std::to_string(int(as)) + "_";
+        }
     }
     return getFunc(name, FUNC_CLIP, axis_s);
 }
@@ -404,6 +486,9 @@ Tensor &Tensor::clip(Chl keep_axis, vector<int> b, vector<int> h, vector<int> s,
     return getFunc("clipaxis", FUNC_CLIPAXIS, axis_s);
 }
 
+Tensor &Tensor::clip(Tensor &index, Chl dim) {
+    return getFunc("cliptensor", FUNC_CLIPTENSOR, {(float)dim}, {&index});
+}
 Tensor &Tensor::expand(int b, int h, int s, int d) {
     return getFunc("expand", FUNC_EXPPAND, {(float)b, (float)h, (float)s, (float)d});
 }
@@ -419,6 +504,9 @@ Tensor &Tensor::where(float value, Chl axis) {
 Tensor &Tensor::index_put(Tensor &value, Tensor &indices, bool accumulate) {
     return getFunc({"index_put"}, FUNC_INDEX_PUT, {(float)accumulate},
                    {&value, &indices});
+}
+void Tensor::scatter_reduce(Tensor &value, Tensor &indices) {
+    getFunc(FUNC_SCATTERREDUCE, {}, {&value, &indices});
 }
 
 Tensor &Tensor::cat(vector<Tensor> input_tensors, Chl axis) {
@@ -468,6 +556,44 @@ vector<std::reference_wrapper<Tensor>> Tensor::split(Tensor &input, std::vector<
     return getStaticFunc(next_names, FUNC_SPLIT, args,
                          {module->activation_tensors[input.name()].get()});
 }
+
+vector<std::reference_wrapper<Tensor>> Tensor::topk(Tensor &input, int k, Chl dim) {
+    Module *module = input.module();
+    return getStaticFunc({input.name() + "-top" + std::to_string(k) + "-value",
+                          input.name() + "-top" + std::to_string(k) + "-idx"},
+                         FUNC_TOPK,
+                         {(float)k, (float)dim},
+                         {module->activation_tensors[input.name()].get()});
+}
+Tensor &Tensor::sum(Chl dim) {
+    return getFunc("sum", FUNC_SUM, {(float)dim});
+}
+Tensor &Tensor::argsort() {
+    return getFunc("argsort", FUNC_ARGSORT, {});
+}
+Tensor &Tensor::bincount() {
+    return getFunc("bincount", FUNC_BINCOUNT, {});
+}
+Tensor &Tensor::repeat(Chl dim, int dim_size) {
+    return getFunc("repeat", FUNC_REPEAT,
+                   {(float)dim, (float)dim_size});
+}
+Tensor &Tensor::zero_like(Tensor &input) {
+    Module *module = input.module();
+    return getStaticFunc({input.name() + "-zero_like"}, FUNC_LIKE, {0.0},
+                         {module->activation_tensors[input.name()].get()})[0]
+        .get();
+}
+Tensor &Tensor::apply_rotary_pos_emb_vision(Tensor &input, Tensor&rotary_pos_emb){
+    Module *module = input.module();
+    return getStaticFunc({input.name() + "-apply_rotary_pos_emb"}, FUNC_APPLY_VISIOROPE, 
+                        {},
+                        {
+                        module->activation_tensors[input.name()].get(),
+                        module->activation_tensors[rotary_pos_emb.name()].get()
+                        })[0].get();
+}
+
 Tensor &Tensor::fuyu_gather_embd(Tensor &word, Tensor &image_patches, Tensor &image_patches_indices) {
     Module *module = word.module();
     return getStaticFunc({word.name() + ".fuyu_gather_embd"}, FUNC_FUYU_GATHER_EMBD,

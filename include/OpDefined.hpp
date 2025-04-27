@@ -37,6 +37,8 @@ enum OpType {
     GATHER,
     CONVOLUTION2D,
     CONVOLUTION3D,
+    VISIONROPE,
+    MULTIMODALROPE,
     AVGPOOL2D,
     MAXPOOL2D,
     CAT,
@@ -61,6 +63,7 @@ enum OpType {
     SPLITINPUT,
     IROPE,
     OP_NUM,
+    NTKROPE,
 
     // add in xnnpack
     DIRECT,
@@ -73,6 +76,7 @@ enum OpType {
 
     // new front-end
     SUPERSILU,
+    HEADLINEAR,
 };
 
 static const vector<string> OpNames = {
@@ -105,6 +109,8 @@ static const vector<string> OpNames = {
     "Gqther",
     "Convolution2D",
     "Convolution3D",
+    "VisonRoPE",
+    "MultimodalRoPE",
     "AvgPool2D",
     "MaxPool2D",
     "Cat",
@@ -139,6 +145,7 @@ static const vector<string> OpNames = {
     "XP_KVCACHE",
     "SDPA",
     "SuperSiLU",
+    "HeadLinear",
 };
 
 enum TensorFuncType {
@@ -146,6 +153,7 @@ enum TensorFuncType {
     FUNC_SUB,
     FUNC_MUL,
     FUNC_DIV,
+    FUNC_DIVINT,
     FUNC_TTADD,
     FUNC_TTSUB,
     FUNC_TTMUL,
@@ -159,11 +167,20 @@ enum TensorFuncType {
     FUNC_FLATTEN,
     FUNC_CLIP,
     FUNC_CLIPAXIS,
+    FUNC_CLIPTENSOR,
     FUNC_RANGE,
     FUNC_WHERE,
     FUNC_INDEX_PUT,
     FUNC_SPLIT,
+    FUNC_SUM,
+    FUNC_TOPK,
     FUNC_EXPPAND,
+    FUNC_ARGSORT,
+    FUNC_BINCOUNT,
+    FUNC_REPEAT,
+    FUNC_LIKE,
+    FUNC_SCATTERREDUCE,
+    FUNC_APPLY_VISIOROPE,
     // models use only
     FUNC_FUYU_GATHER_EMBD,
     FUNC_PHI3V_HD_MERGE,

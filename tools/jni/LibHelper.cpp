@@ -68,19 +68,22 @@ bool LibHelper::setUp(const std::string &base_path, std::string weights_path, st
     switch (model) {
     case QWEN25:
         qwconfig = QWenConfig(tokens_limit, "1.5B");
+        tokenizer_ = make_shared<QWenTokenizer>(vocab_path, merge_path);
+        module_ = make_shared<QWenForCausalLM>(qwconfig);
+        break;
     case QWEN15:
         qwconfig = QWenConfig(tokens_limit, "1.8B");
         tokenizer_ = make_shared<QWenTokenizer>(vocab_path, merge_path);
         module_ = make_shared<QWenForCausalLM>(qwconfig);
 #ifdef USE_QNN
         if (backend_type == MLLMBackendType::QNN) {
-            prefill_module_ = make_shared<QWenForCausalLM_NPU>(qwconfig);
+            int chunk_size = 64;
+            prefill_module_ = make_shared<QWenForCausalLM_NPU>(qwconfig, chunk_size);
             prefill_module_->load(qnn_weights_path);
 
             auto tokenizer = dynamic_pointer_cast<QWenTokenizer>(tokenizer_);
             // warmup START
             std::string input_str = " ";
-            int chunk_size = 64;
             auto res = tokenizer->tokenizePaddingByChunk(input_str, chunk_size, 151936);
             auto input_tensor = res.second;
             auto real_seq_length = res.first;
@@ -98,7 +101,7 @@ bool LibHelper::setUp(const std::string &base_path, std::string weights_path, st
                 return true;
             });
             Module::isFirstChunk = false;
-            static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setSequenceLength(0);
+            static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setCurSequenceLength(0);
             static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setExecutionType(PROMPT);
             static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->toggleSwitching();
             Module::isMultiChunkPrefilling = true;
@@ -146,7 +149,7 @@ bool LibHelper::setUp(const std::string &base_path, std::string weights_path, st
                 return true;
             });
             Module::isFirstChunk = false;
-            static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setSequenceLength(0);
+            static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setCurSequenceLength(0);
             static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setExecutionType(PROMPT);
             static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->toggleSwitching();
             Module::isMultiChunkPrefilling = true;
@@ -186,6 +189,11 @@ void LibHelper::run(std::string &input_str, uint8_t *image, unsigned max_step, u
             const int chunk_num = seq_length_padding / chunk_size;
             bool isSwitched = false;
 
+            // set total seq length for HeadLinear execute, which can not get the real seq length from Opts
+            static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setTotalSequenceLength(real_seq_length);
+            // set chunk size for the HeadLinear execute, which can not get the chunk size from Opts
+            static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setChunkSize(chunk_size);
+
             LlmTextGeneratorOpts opt{
                 .max_new_tokens = 1,
                 .do_sample = false,
@@ -199,7 +207,7 @@ void LibHelper::run(std::string &input_str, uint8_t *image, unsigned max_step, u
                 chunked_tensors[chunk_id].setTtype(INPUT_TENSOR);
                 chunked_tensors[chunk_id].reshape(1, 1, chunk_size, 1);
                 chunked_tensors[chunk_id].setName("input-chunk-" + to_string(chunk_id));
-                chunked_tensors[chunk_id].deepCopyFrom(&input_tensor, false, {0, 0, chunk_id * chunk_size, 0});
+                chunked_tensors[chunk_id].shallowCopyFrom(&input_tensor, false, {0, 0, chunk_id * chunk_size, 0});
 
                 prefill_module_->generate(chunked_tensors[chunk_id], opt, [&](unsigned int out_token) -> bool {
                     if (!isSwitched && chunk_id == 0 && static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->isStageSwitching()) {
@@ -226,7 +234,7 @@ void LibHelper::run(std::string &input_str, uint8_t *image, unsigned max_step, u
                 });
                 Module::isFirstChunk = false;
             }
-            static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setSequenceLength(real_seq_length);
+            static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setCurSequenceLength(real_seq_length);
             static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setExecutionType(AUTOREGRESSIVE);
             static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->toggleSwitching();
 
@@ -259,7 +267,7 @@ void LibHelper::run(std::string &input_str, uint8_t *image, unsigned max_step, u
                 if (!not_end) { return false; }
                 return true;
             });
-            static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setSequenceLength(0);
+            static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setCurSequenceLength(0);
             static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setExecutionType(PROMPT);
             static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->toggleSwitching();
         } else { // CPU
@@ -318,6 +326,11 @@ void LibHelper::run(std::string &input_str, uint8_t *image, unsigned max_step, u
             const int chunk_num = seq_length_padding / chunk_size;
             bool isSwitched = false;
 
+            // set total seq length for HeadLinear execute, which can not get the real seq length from Opts
+            static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setTotalSequenceLength(real_seq_length);
+            // set chunk size for the HeadLinear execute, which can not get the chunk size from Opts
+            static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setChunkSize(chunk_size);
+
             LlmTextGeneratorOpts opt{
                 .max_new_tokens = 1,
                 .do_sample = false,
@@ -331,7 +344,7 @@ void LibHelper::run(std::string &input_str, uint8_t *image, unsigned max_step, u
                 chunked_tensors[chunk_id].setTtype(INPUT_TENSOR);
                 chunked_tensors[chunk_id].reshape(1, 1, chunk_size, 1);
                 chunked_tensors[chunk_id].setName("input-chunk-" + to_string(chunk_id));
-                chunked_tensors[chunk_id].deepCopyFrom(&input_tensor, false, {0, 0, chunk_id * chunk_size, 0});
+                chunked_tensors[chunk_id].shallowCopyFrom(&input_tensor, false, {0, 0, chunk_id * chunk_size, 0});
 
                 prefill_module_->generate(chunked_tensors[chunk_id], opt, [&](unsigned int out_token) -> bool {
                     // if (switch_flag && !isSwitched && chunk_id == 0) {
@@ -360,7 +373,7 @@ void LibHelper::run(std::string &input_str, uint8_t *image, unsigned max_step, u
                 });
                 Module::isFirstChunk = false;
             }
-            static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setSequenceLength(real_seq_length);
+            static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setCurSequenceLength(real_seq_length);
             static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setExecutionType(AUTOREGRESSIVE);
             static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->toggleSwitching();
 
@@ -393,7 +406,7 @@ void LibHelper::run(std::string &input_str, uint8_t *image, unsigned max_step, u
                 if (!not_end) { return false; }
                 return true;
             });
-            static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setSequenceLength(0);
+            static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setCurSequenceLength(0);
             static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->setExecutionType(PROMPT);
             static_cast<CPUBackend *>(Backend::global_backends[MLLM_CPU])->toggleSwitching();
         } else { // CPU

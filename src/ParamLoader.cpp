@@ -31,6 +31,15 @@ namespace mllm {
 bool ParamLoader::load(mllm::Tensor *tensor) {
     string name = tensor->name();
 #ifndef USE_MMAP
+    std::lock_guard<std::mutex> lock(mtx);
+    if (offsets_.find(name) == offsets_.end()) { return false; }
+    std::pair<uint64_t, uint64_t> offset = offsets_[name];
+    auto *p = tensor->hostPtr<char>();
+    fseek(fp_, offset.first, SEEK_SET);
+    size_t read_size = std::min(tensor->cntSize(), offset.second);
+    auto _ = fread(p, sizeof(uint8_t), read_size, fp_);
+
+    /*
     if (offsets_.find(name) == offsets_.end()) { return false; }
     std::pair<uint64_t, uint64_t> offset = offsets_[name];
     uint8_t *data = new uint8_t[offset.second];
@@ -47,6 +56,7 @@ bool ParamLoader::load(mllm::Tensor *tensor) {
         memcpy(static_cast<void *>(p), static_cast<void *>(data),
                tensor->cntSize()); // Cast pointers to void*
     delete[] data;                 // Free the memory allocated by new
+    */
     return true;
 #endif
 }
@@ -157,7 +167,11 @@ bool MultiFileParamLoader::load(mllm::Tensor *tensor) {
     auto [offset, size] = offsets_[name];
     void *p = tensor->rawHostPtr();
     fseek(fp, (long)offset, SEEK_SET);
-    auto _ = fread(p, sizeof(uint8_t), size, fp);
+    auto read_size = fread(p, sizeof(uint8_t), size, fp);
+    assert(read_size == size);
+    auto tensor_size = tensor->cntSize();
+//    tensor->printShape();
+    assert(tensor_size == size);
     return true;
 }
 
@@ -168,7 +182,7 @@ bool MultiFileParamLoader::load(std::shared_ptr<mllm::Tensor> tensor) {
 size_t MultiFileParamLoader::getTensorSize(string name) {
     auto it = files_.find(name);
     if (it == files_.end())
-        throw std::runtime_error("name not found");
+        throw std::runtime_error("name: '" + name + "'not found");
     auto t = offsets_[name];
     return t.second;
 }
@@ -176,7 +190,7 @@ size_t MultiFileParamLoader::getTensorSize(string name) {
 DataType MultiFileParamLoader::getDataType(string name) {
     auto it = data_type_.find(name);
     if (it == data_type_.end())
-        throw std::runtime_error("name not found, can not get data type");
+        throw std::runtime_error("name: '" + name + "' not found, can not get data type");
     return data_type_[name];
 }
 
@@ -202,7 +216,7 @@ void MultiFileParamLoader::load_file(const string &filename) {
         offsets_[name] = std::make_pair(offset, length);
         data_type_[name] = type;
         files_[name] = fp;
-        //        printf("loaded %s\n", name.c_str());
+//        printf("loaded %s\n", name.c_str());
     }
 }
 MultiFileParamLoader::~MultiFileParamLoader() {
